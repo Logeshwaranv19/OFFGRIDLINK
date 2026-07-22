@@ -1,0 +1,653 @@
+// OffGridLink - Teacher PeerJS Module
+// v2: Stable Peer ID, quiz preload cache, quiz list broadcasting, QR code display
+
+(function () {
+    const PEERJS_PATH = './peerjs.min.js';
+
+    const MAX_PEERS = 6;
+    const MAX_QUIZ_CACHE_SIZE = 100; // Cap cache size to prevent memory bloat (Issue #10)
+    let peer = null;
+    let connectedPeers = {}; // { peerId: DataConnection }
+    let connectedNames = {}; // { peerId: studentName }
+    let teacherPeerId = null;
+    let quizCache = {}; // quizId -> quiz (preloaded for fast distribution)
+
+    // ─── Stable Teacher Peer ID ──────────────────────────────
+    function getOrCreateTeacherId() {
+        let id = localStorage.getItem('teacher-stable-peer-id');
+        const code = id ? id.replace(/^teacher-/, '') : '';
+        // Accept only "teacher-NNNNNN" (6 digits); migrate all legacy IDs
+        if (!id || !/^\d{6}$/.test(code)) {
+            const newCode = String(Math.floor(100000 + Math.random() * 900000));
+            id = 'teacher-' + newCode;
+            localStorage.setItem('teacher-stable-peer-id', id);
+        }
+        return id;
+    }
+
+    // Format "teacher-482391" → "482-391" for display
+    function formatPeerIdForDisplay(id) {
+        const code = id.replace(/^teacher-/, '');
+        if (/^\d{6}$/.test(code)) return code.slice(0, 3) + '-' + code.slice(3);
+        return id; // legacy IDs shown as-is
+    }
+
+    // ── AUTO-DETECT IP HELPER ─────────────────────────────
+    function autoDetectIP(peerId) {
+        const ipEl = document.getElementById('teacher-ip-display');
+
+        function setDetectedIP(ip) {
+            if (ipEl) ipEl.value = ip;
+            window.teacherLocalIP = ip;
+            localStorage.setItem('teacher-local-ip', ip);
+            generateQRCode(peerId, ip);
+            console.log('[PeerJS] Detected local IP:', ip);
+        }
+
+        function fallbackToSavedIP() {
+            const savedIP = localStorage.getItem('teacher-local-ip');
+            if (savedIP && ipEl) ipEl.value = savedIP;
+            window.teacherLocalIP = savedIP || null;
+            generateQRCode(peerId, savedIP || null);
+            console.warn('[PeerJS] Could not auto-detect IP. Using saved:', savedIP);
+        }
+
+        if (window.electronAPI && window.electronAPI.getLocalIP) {
+            window.electronAPI.getLocalIP().then((ip) => {
+                if (ip) setDetectedIP(ip);
+                else fallbackToSavedIP();
+            }).catch(() => fallbackToSavedIP());
+
+            // Also keep the listener in case it pushes updates later
+            window.electronAPI.onLocalIP((ip) => {
+                setDetectedIP(ip);
+            });
+        } else if (window.electronAPI) {
+            window.electronAPI.onLocalIP((ip) => {
+                setDetectedIP(ip);
+            });
+        } else {
+            fetch('/api/local-ip')
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.ip) setDetectedIP(data.ip);
+                    else fallbackToSavedIP();
+                })
+                .catch(() => fallbackToSavedIP());
+        }
+    }
+
+    function loadPeerJS(callback) {
+        if (window.Peer) { callback(); return; }
+        const s = document.createElement('script');
+        s.src = PEERJS_PATH;
+        s.onload = callback;
+        s.onerror = () => { console.warn('[PeerJS] CDN load failed - offline?'); };
+        document.head.appendChild(s);
+    }
+
+    function initTeacherPeer() {
+        const stableId = getOrCreateTeacherId();
+        const el = document.getElementById('teacher-peer-id');
+        if (el) el.textContent = formatPeerIdForDisplay(stableId);
+
+        // ── AUTO-DETECT IP IMMEDIATELY ──
+        autoDetectIP(stableId);
+
+        const ipEl = document.getElementById('teacher-ip-display');
+        if (ipEl) {
+            // Regenerate QR if teacher manually edits the IP field
+            ipEl.addEventListener('input', () => {
+                const v = ipEl.value.trim();
+                window.teacherLocalIP = v;
+                localStorage.setItem('teacher-local-ip', v);
+                generateQRCode(window.teacherPeerId || stableId, v);
+            });
+        }
+
+        const refreshBtn = document.getElementById('refresh-ip-btn');
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', () => {
+                showToast('Refreshing IP...', 'info');
+                autoDetectIP(window.teacherPeerId || stableId);
+            });
+        }
+
+        loadPeerJS(() => {
+            if (!window.Peer) {
+                updateP2PStatus(false, 'PeerJS unavailable');
+                return;
+            }
+
+            // Try to connect to local Electron peer server first
+            const peerOptions = {
+                host: 'localhost',
+                port: 9000,
+                path: '/offgrid',
+                debug: 1
+            };
+
+            try {
+                peer = new Peer(stableId, peerOptions);
+            } catch (e) {
+                peer = new Peer(undefined, peerOptions);
+            }
+
+            peer.on('open', id => {
+                teacherPeerId = id;
+                // Update stored stable ID if server assigned a different one
+                localStorage.setItem('teacher-stable-peer-id', id);
+                console.log('[PeerJS] Teacher Peer ID:', id);
+
+                if (el) el.textContent = id;
+                updateP2PStatus(true, `P2P Online – ${Object.keys(connectedPeers).length} students`);
+                window.teacherPeerId = id;
+
+                // Preload all published quizzes into memory cache
+                preloadQuizCache();
+            });
+
+            peer.on('connection', conn => {
+                console.log('[PeerJS] New student connected:', conn.peer);
+                setupConnection(conn);
+            });
+
+            peer.on('error', err => {
+                console.error('[PeerJS] Error:', err.type, err.message);
+                // If local server not available, fall back to public broker
+                if (err.type === 'server-error' || err.type === 'network') {
+                    console.log('[PeerJS] Local server failed. Falling back to public broker...');
+                    fallbackToPublicBroker(stableId);
+                } else {
+                    updateP2PStatus(false, 'P2P Error: ' + err.type);
+                }
+            });
+
+            peer.on('disconnected', () => {
+                console.warn('[PeerJS] Disconnected from broker, reconnecting...');
+                updateP2PStatus(false, 'Reconnecting…');
+                peer.reconnect();
+            });
+        });
+    }
+
+    function fallbackToPublicBroker(stableId) {
+        if (peer && !peer.destroyed) { peer.destroy(); }
+        try {
+            peer = new Peer(stableId, { debug: 1 });
+        } catch (e) {
+            peer = new Peer(undefined, { debug: 1 });
+        }
+
+        peer.on('open', id => {
+            teacherPeerId = id;
+            localStorage.setItem('teacher-stable-peer-id', id);
+            const el = document.getElementById('teacher-peer-id');
+            if (el) el.textContent = formatPeerIdForDisplay(id);
+            updateP2PStatus(true, 'P2P Online (Public Broker)');
+            window.teacherPeerId = id;
+
+            autoDetectIP(id);
+            preloadQuizCache();
+        });
+
+        peer.on('connection', conn => { setupConnection(conn); });
+        peer.on('error', err => {
+            console.error('[PeerJS] Public broker error:', err.type);
+            updateP2PStatus(false, 'P2P Error: ' + err.type);
+        });
+        peer.on('disconnected', () => {
+            updateP2PStatus(false, 'Reconnecting…');
+            peer.reconnect();
+        });
+    }
+
+    function setupConnection(conn) {
+        if (Object.keys(connectedPeers).length >= MAX_PEERS) {
+            conn.send({ type: 'error', message: 'Teacher peer limit reached. Try again later.' });
+            setTimeout(() => conn.close(), 200);
+            console.warn('[PeerJS] Rejected connection — peer limit reached:', conn.peer);
+            return;
+        }
+        conn.on('open', () => {
+            connectedPeers[conn.peer] = conn;
+            const studentName = (conn.metadata && conn.metadata.name) ? conn.metadata.name : conn.peer.substring(0, 8) + '…';
+            connectedNames[conn.peer] = studentName;
+            console.log('[PeerJS] Connection open with:', conn.peer, 'Name:', studentName);
+            renderConnectedPeers();
+            showToast(`🟢 Student connected: ${studentName}`, 'success');
+
+            // Send welcome with server time
+            conn.send({ type: 'welcome', teacherId: teacherPeerId, serverTime: Date.now() });
+
+            // Send current leaderboard state if available
+            if (window.currentLeaderboardData) {
+                conn.send({ type: 'leaderboard_update', data: window.currentLeaderboardData });
+            }
+        });
+
+        conn.on('data', data => {
+            console.log('[PeerJS] Received from', conn.peer, ':', data);
+            handleStudentMessage(conn.peer, data);
+        });
+
+        conn.on('close', () => {
+            const name = connectedNames[conn.peer] || conn.peer.substring(0, 8);
+            console.log('[PeerJS] Connection closed:', conn.peer);
+            delete connectedPeers[conn.peer];
+            delete connectedNames[conn.peer];
+            renderConnectedPeers();
+            showToast(`🔴 ${name} disconnected`, 'info');
+        });
+
+        conn.on('error', err => {
+            console.error('[PeerJS] Connection error:', err);
+            delete connectedPeers[conn.peer];
+            delete connectedNames[conn.peer];
+            renderConnectedPeers();
+        });
+    }
+
+    // ─── Handle Student Messages ─────────────────────────────
+    async function handleStudentMessage(peerId, data) {
+        if (!data || !data.type) return;
+
+        switch (data.type) {
+            case 'quiz_request':
+                console.log('[PeerJS] Quiz request from:', peerId, 'for:', data.quizId);
+                await sendQuizToPeer(peerId, data.quizId);
+                break;
+
+            case 'quiz_list_request':
+                console.log('[PeerJS] Quiz list request from:', peerId);
+                await sendQuizListToPeer(peerId);
+                break;
+
+            case 'leaderboard_request':
+                console.log('[PeerJS] Leaderboard request from:', peerId, 'QuizId:', data.quizId);
+
+                if (data.quizId) {
+                    // Specific quiz leaderboard requested, calculate it on the fly
+                    try {
+                        const result = await window.resultsDB.allDocs({ include_docs: true });
+                        const rawResults = result.rows.map(r => r.doc).filter(d => d.type === 'result');
+
+                        // Deduplicate logic
+                        const dedupedMap = {};
+                        rawResults.sort((a, b) => (a.gradedAt || '').localeCompare(b.gradedAt || '')).forEach(r => {
+                            const key = `${r.quizId}_${r.studentId || r.studentName}`;
+                            dedupedMap[key] = r;
+                        });
+
+                        // Filter by quizId
+                        const results = Object.values(dedupedMap).filter(r => r.quizId === data.quizId);
+
+                        // Aggregate scores
+                        const scoresMap = {};
+                        results.forEach(r => {
+                            const key = r.studentId || r.studentName;
+                            if (!scoresMap[key]) {
+                                scoresMap[key] = { studentId: key, studentName: r.studentName, totalScore: 0, quizzesTaken: 0 };
+                            }
+                            scoresMap[key].totalScore += (r.score || 0);
+                            scoresMap[key].quizzesTaken += 1;
+                        });
+
+                        const customLeaderboard = Object.values(scoresMap).sort((a, b) => b.totalScore - a.totalScore);
+
+                        if (connectedPeers[peerId]) {
+                            connectedPeers[peerId].send({ type: 'leaderboard_update', data: customLeaderboard });
+                        }
+                    } catch (err) {
+                        console.error('[PeerJS] Error generating custom leaderboard', err);
+                    }
+                } else {
+                    // Send current global leaderboard
+                    if (window.currentLeaderboardData && connectedPeers[peerId]) {
+                        connectedPeers[peerId].send({ type: 'leaderboard_update', data: window.currentLeaderboardData });
+                    } else if (window.loadLeaderboard) {
+                        window.loadLeaderboard();
+                    }
+                }
+                break;
+
+            case 'submission':
+                console.log('[PeerJS] Submission received from:', peerId);
+                await handleSubmission(peerId, data);
+                break;
+
+            case 'ping':
+                if (connectedPeers[peerId]) {
+                    connectedPeers[peerId].send({ type: 'pong', time: Date.now() });
+                }
+                break;
+
+            default:
+                console.log('[PeerJS] Unknown message type:', data.type);
+        }
+    }
+
+    // ─── Send Quiz to Peer (from cache for speed) ────────────
+    async function sendQuizToPeer(peerId, quizId) {
+        try {
+            let studentVersion;
+
+            // Try from in-memory cache first (sub-1ms)
+            if (quizCache[quizId]) {
+                studentVersion = makeStudentVersion(quizCache[quizId]);
+            } else {
+                const quiz = await window.quizzesDB.get(quizId);
+                studentVersion = makeStudentVersion(quiz);
+            }
+
+            if (connectedPeers[peerId]) {
+                connectedPeers[peerId].send({ type: 'quiz_data', quiz: studentVersion });
+                const name = connectedNames[peerId] || peerId.substring(0, 8);
+                console.log('[PeerJS] Sent quiz to:', name);
+                showToast(`Quiz sent to ${name}`, 'success');
+            }
+        } catch (err) {
+            console.error('[PeerJS] Error sending quiz:', err);
+            if (connectedPeers[peerId]) {
+                try {
+                    connectedPeers[peerId].send({ type: 'quiz_error', message: 'Quiz not found or unavailable. Ask your teacher to resend.' });
+                } catch (_) { }
+            }
+        }
+    }
+
+    // ─── Send Quiz List to Peer ──────────────────────────────
+    async function sendQuizListToPeer(peerId) {
+        try {
+            const result = await window.quizzesDB.allDocs({ include_docs: true });
+            const quizzes = result.rows.map(r => r.doc)
+                .filter(d => d.type === 'quiz' && d.isPublished)
+                .map(q => ({
+                    _id: q._id,
+                    title: q.title,
+                    subject: q.subject || 'General',
+                    questions: q.questions.length,
+                    totalPoints: q.totalPoints,
+                    timeLimit: q.timeLimit,
+                    createdAt: q.createdAt
+                }));
+
+            if (connectedPeers[peerId]) {
+                connectedPeers[peerId].send({ type: 'quiz_list', quizzes });
+                console.log('[PeerJS] Sent quiz list to:', peerId, '- Count:', quizzes.length);
+            }
+        } catch (err) {
+            console.error('[PeerJS] Error sending quiz list:', err);
+        }
+    }
+
+    // ─── Handle Submission ───────────────────────────────────
+    async function handleSubmission(peerId, data) {
+        try {
+            const studentName = data.studentName || connectedNames[peerId] || 'Anonymous';
+            const submission = {
+                _id: `sub_${data.quizId}_${peerId.replace(/[^a-z0-9]/gi, '').substr(0, 10)}`,
+                type: 'submission',
+                quizId: data.quizId,
+                quizTitle: data.quizTitle || '',
+                studentId: peerId,
+                studentName,
+                answers: data.answers || {},
+                submittedAt: data.submittedAt || new Date().toISOString(),
+                syncStatus: 'received'
+            };
+
+            await window.submissionsDB.put(submission);
+            console.log('[PeerJS] Submission saved:', submission._id);
+
+            // Auto-score immediately
+            let gradedResult = null;
+            if (typeof window.autoScoreSubmission === 'function') {
+                gradedResult = await window.autoScoreSubmission(submission);
+            }
+
+            // Acknowledge
+            if (connectedPeers[peerId]) {
+                connectedPeers[peerId].send({
+                    type: 'submission_ack',
+                    submissionId: submission._id,
+                    status: 'received',
+                    result: gradedResult
+                });
+            }
+
+            window.dispatchEvent(new Event('submission-received'));
+            showToast(`Submission received from ${studentName}`, 'success');
+        } catch (err) {
+            console.error('[PeerJS] Error handling submission:', err);
+        }
+    }
+
+    // ─── Broadcast Quiz to All Students ─────────────────────
+    window.sendQuizToAllStudents = async function (quizId) {
+        const peers = Object.keys(connectedPeers);
+        if (peers.length === 0) {
+            showToast('No students connected!', 'error');
+            return;
+        }
+
+        let studentVersion;
+        if (quizCache[quizId]) {
+            studentVersion = makeStudentVersion(quizCache[quizId]);
+        } else {
+            const quiz = await window.quizzesDB.get(quizId);
+            studentVersion = makeStudentVersion(quiz);
+        }
+
+        let sent = 0, failed = 0;
+        peers.forEach(peerId => {
+            try {
+                connectedPeers[peerId].send({ type: 'quiz_data', quiz: studentVersion });
+                sent++;
+            } catch (err) {
+                console.error('[PeerJS] Failed to send to peer:', peerId, err);
+                failed++;
+            }
+        });
+
+        if (failed === 0) {
+            showToast(`Quiz sent to all ${sent} student(s)`, 'success');
+        } else {
+            showToast(`Quiz sent to ${sent}/${peers.length} student(s) — ${failed} failed`, 'error');
+        }
+        console.log('[PeerJS] Quiz broadcasted to', sent, 'peers,', failed, 'failed');
+    };
+
+    // ─── Broadcast Leaderboard ──────────────────────────────
+    window.broadcastLeaderboard = function (leaderboardData) {
+        const peers = Object.keys(connectedPeers);
+        if (peers.length === 0) return;
+
+        peers.forEach(peerId => {
+            try {
+                connectedPeers[peerId].send({ type: 'leaderboard_update', data: leaderboardData });
+            } catch (err) { }
+        });
+    };
+
+    // ─── Strip Answer Fields for Students ───────────────────
+    function makeStudentVersion(quiz) {
+        return {
+            _id: quiz._id,
+            type: 'student_quiz',
+            title: quiz.title,
+            subject: quiz.subject,
+            description: quiz.description,
+            timeLimit: quiz.timeLimit,
+            createdBy: quiz.createdBy,
+            createdAt: quiz.createdAt,
+            totalPoints: quiz.totalPoints,
+            questions: quiz.questions.map(q => ({
+                id: q.id,
+                type: q.type,
+                text: q.text,
+                options: q.options || [],
+                points: q.points,
+                answerType: q.answerType || 'single'
+                // answer field intentionally stripped
+            }))
+        };
+    }
+    window.teacherPeerModule = { initTeacherPeer, makeStudentVersion };
+
+    // ─── Preload Quiz Cache ──────────────────────────────────
+    async function preloadQuizCache() {
+        try {
+            const result = await window.quizzesDB.allDocs({ include_docs: true });
+            const allQuizzes = result.rows
+                .map(r => r.doc)
+                .filter(d => d && d.type === 'quiz')
+                .sort((a, b) => b.createdAt.localeCompare(a.createdAt)); // Sort by recency
+
+            // Clear and rebuild cache (Issue #11 - removed full rebuild)
+            quizCache = {};
+
+            // Cache only the most recent quizzes up to MAX_QUIZ_CACHE_SIZE (Issue #10 - cap size)
+            allQuizzes.slice(0, MAX_QUIZ_CACHE_SIZE).forEach(quiz => {
+                quizCache[quiz._id] = quiz;
+            });
+
+            console.log('[PeerJS] Quiz cache loaded:', Object.keys(quizCache).length, '/', allQuizzes.length, 'quizzes');
+
+            if (allQuizzes.length > MAX_QUIZ_CACHE_SIZE) {
+                console.warn(`[PeerJS] Cache size capped at ${MAX_QUIZ_CACHE_SIZE}. Total quizzes: ${allQuizzes.length}`);
+            }
+        } catch (e) {
+            console.warn('[PeerJS] Cache preload failed:', e);
+        }
+    }
+
+    // Refresh cache when DB changes or quiz is deleted
+    window.addEventListener('db-changed', () => preloadQuizCache());
+    window.addEventListener('quiz-saved', () => preloadQuizCache());
+
+    // ─── Render Connected Peers ──────────────────────────────
+    function renderConnectedPeers() {
+        const container = document.getElementById('connected-peers-list');
+        if (!container) return;
+        const peers = Object.keys(connectedPeers);
+        const countEl = document.getElementById('connected-count');
+        if (countEl) countEl.textContent = peers.length;
+        const sideCountEl = document.getElementById('connected-students-badge');
+        if (sideCountEl) sideCountEl.textContent = peers.length;
+
+        if (peers.length === 0) {
+            container.innerHTML = '<p style="font-size:13px;color:var(--text-muted);">No students connected yet</p>';
+        } else {
+            container.innerHTML = peers.map(p => {
+                const name = connectedNames[p] || p.substring(0, 12) + '…';
+                return `
+                <div class="student-row">
+                    <span class="status-dot online"></span>
+                    <span class="student-name">${name}</span>
+                    <span class="student-peer-id">${p}</span>
+                </div>`;
+            }).join('');
+        }
+        updateP2PStatus(true, `P2P Online – ${peers.length} student(s)`);
+    }
+
+    // ─── P2P Status Dot ─────────────────────────────────────
+    function updateP2PStatus(online, text) {
+        const badge = document.getElementById('p2p-status-badge');
+        const dot = document.getElementById('p2p-dot');
+        const textEl = document.getElementById('p2p-text');
+        if (badge) {
+            badge.classList.toggle('badge-online', online);
+            badge.classList.toggle('badge-offline', !online);
+        }
+        if (dot) {
+            dot.classList.toggle('online', online);
+            dot.classList.toggle('offline', !online);
+        }
+        if (textEl) textEl.textContent = text || (online ? 'P2P: Online' : 'P2P: Offline');
+    }
+
+    // ─── QR Code Generation ──────────────────────────────────
+    function generateQRCode(peerId, ip) {
+        const container = document.getElementById('qr-container');
+        if (!container) return;
+
+        const info = ip
+            ? `OffGridLink\nIP:${ip}:9000\nPeerID:${peerId}`
+            : `OffGridLink\nPeerID:${peerId}`;
+
+        // Use local QRCode (already loaded in teacher.html)
+        if (window.QRCode) {
+            container.innerHTML = '';
+            new QRCode(container, {
+                text: info,
+                width: 180,
+                height: 180,
+                colorDark: '#000000',
+                colorLight: '#ffffff',
+                correctLevel: QRCode.CorrectLevel.H
+            });
+        }
+    }
+
+    // ─── Detect Local IP (Browser) ───────────────────────────
+    async function detectLocalIP() {
+        return new Promise(resolve => {
+            try {
+                const pc = new RTCPeerConnection({ iceServers: [] });
+                pc.createDataChannel('');
+                pc.createOffer().then(o => pc.setLocalDescription(o));
+                pc.onicecandidate = e => {
+                    if (!e || !e.candidate) { pc.close(); resolve(null); return; }
+                    const match = e.candidate.candidate.match(/(\d+\.\d+\.\d+\.\d+)/);
+                    if (match && !match[1].startsWith('127.') && !match[1].startsWith('169.')) {
+                        pc.close();
+                        resolve(match[1]);
+                    }
+                };
+                setTimeout(() => { pc.close(); resolve(null); }, 2000);
+            } catch (e) { resolve(null); }
+        });
+    }
+
+    // ─── Toast Helper ────────────────────────────────────────
+    function showToast(message, type = 'info') {
+        if (window.showToast) { window.showToast(message, type); return; }
+        const container = document.getElementById('toast-container');
+        if (!container) return;
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.textContent = message;
+        container.appendChild(toast);
+        setTimeout(() => toast.remove(), 4000);
+    }
+
+    // ─── DOM Ready ───────────────────────────────────────────
+    document.addEventListener('DOMContentLoaded', () => {
+        // Copy peer ID button
+        const copyBtn = document.getElementById('copy-peer-id-btn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', () => {
+                const id = document.getElementById('teacher-peer-id').textContent;
+                if (!id || id === '···-···' || id === 'Initializing…') { showToast('Peer ID not ready yet', 'error'); return; }
+                navigator.clipboard.writeText(id).then(() => {
+                    copyBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
+                    setTimeout(() => { copyBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy ID'; }, 2000);
+                }).catch(() => {
+                    // Fallback for older browsers
+                    const el = document.createElement('textarea');
+                    el.value = id;
+                    document.body.appendChild(el);
+                    el.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(el);
+                    copyBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Copied!';
+                    setTimeout(() => { copyBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy ID'; }, 2000);
+                });
+            });
+        }
+
+        initTeacherPeer();
+    });
+})();
